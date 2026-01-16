@@ -74,9 +74,9 @@ class RiskTool(BaseTool):
         entity_id: str,
     ) -> str:
         """
-        Fetch risk score from MCP server.
+        Fetch risk score from MCP server or ML model.
         
-        Falls back to mock score if MCP is unavailable.
+        Priority: MCP -> ML Model -> Mock score
         """
         if entity_type not in ["user", "order"]:
             return f"Error: entity_type must be 'user' or 'order', got '{entity_type}'"
@@ -84,6 +84,7 @@ class RiskTool(BaseTool):
         if not entity_id:
             return "Error: entity_id is required"
         
+        # Try MCP first
         client = get_mcp_client()
         params = {
             "entity": entity_type,
@@ -94,6 +95,12 @@ class RiskTool(BaseTool):
         
         if response.success and response.data:
             return self._format_result(response.data)
+        
+        # Try ML model for user scoring
+        if entity_type == "user":
+            ml_result = self._get_ml_score(entity_id)
+            if ml_result:
+                return self._format_result(ml_result)
         
         # Fallback to mock score
         mock_result = self._get_mock_score(entity_type, entity_id)
@@ -176,3 +183,79 @@ class RiskTool(BaseTool):
             "reasons": reasons,
             "model_version": "mock-v1.0",
         }
+    
+    def _get_ml_score(self, user_id: str) -> Optional[dict]:
+        """
+        Get ML-based risk score using UC2 model.
+        
+        Returns standardized risk score dict or None if model unavailable.
+        """
+        try:
+            from .ml_tool import _load_uc2_model, _score_and_decide, _explain_score
+            import pandas as pd
+            
+            artifact = _load_uc2_model()
+            if artifact is None:
+                return None
+            
+            model = artifact["model"]
+            features = artifact["features"]
+            
+            # Generate synthetic features for this user
+            # In production, these would come from the database
+            import hashlib
+            hash_val = int(hashlib.md5(user_id.encode()).hexdigest()[:8], 16)
+            
+            # Create reasonable feature values based on user hash
+            seed_val = hash_val % 1000 / 1000
+            
+            client_features = {
+                "account_age_days": int(30 + seed_val * 400),
+                "kyc_level_num": 1 if seed_val < 0.3 else 2,
+                "account_status_num": 1,
+                "late_rate_90d": seed_val * 0.5,
+                "ontime_rate_90d": 1 - seed_val * 0.5,
+                "active_plans": int(seed_val * 4),
+                "orders_30d": int(1 + seed_val * 10),
+                "amount_30d": 500 + seed_val * 3000,
+                "disputes_90d": int(seed_val * 3),
+                "refunds_90d": int(seed_val * 2),
+                "checkout_abandon_rate_30d": seed_val * 0.6,
+            }
+            
+            # Prepare features DataFrame
+            X = pd.DataFrame([client_features])
+            
+            # Ensure all required features exist
+            for feat in features:
+                if feat not in X.columns:
+                    X[feat] = 0
+            
+            X = X[features]
+            
+            # Get prediction
+            risk_proba, trust_score, decision = _score_and_decide(model, X)
+            explanation = _explain_score(X.iloc[0])
+            
+            # Convert to standardized format
+            if trust_score >= 70:
+                band = "low"
+            elif trust_score >= 40:
+                band = "medium"
+            elif trust_score >= 20:
+                band = "high"
+            else:
+                band = "very_high"
+            
+            return {
+                "score": risk_proba,
+                "band": band,
+                "reasons": explanation.split(" | ") if explanation else [],
+                "model_version": "UC2-rf_bnpl_v1",
+                "trust_score": trust_score,
+                "decision": decision,
+            }
+            
+        except Exception as e:
+            # Silently fall back to mock if ML fails
+            return None

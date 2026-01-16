@@ -7,6 +7,7 @@ from .sql_tool import SQLTool
 from .risk_tool import RiskTool
 from .trace_tool import TraceTool
 from .local_data import LocalDataAdapter, get_local_data
+from .ml_tool import MLPredictionTool, get_ml_tool
 
 __all__ = [
     "MCPClient",
@@ -20,4 +21,7 @@ __all__ = [
     "TraceTool",
     "LocalDataAdapter",
     "get_local_data",
+    "MLPredictionTool",
+    "get_ml_tool",
 ]
+
