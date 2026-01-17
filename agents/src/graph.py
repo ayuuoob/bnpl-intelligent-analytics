@@ -23,22 +23,72 @@ from .nodes import (
     NarratorNode,
 )
 
+# Backup API keys for rotation when rate limited
+BACKUP_API_KEYS = [
+    "AIzaSyD1TgM4t5OzhEjQX8JOwq7rXfQJYTFcHRQ",
+    "AIzaSyBrK8Oby0jULyMdf6rPyf4v3UuhQH_6kek",
+    "AIzaSyCFSlT8bDXXrs4a4niOOeaFLyRFIv1Rh4Y",
+]
+
+# Track current API key index
+_current_key_index = 0
+_llm_instance = None
+
+
+def get_next_api_key() -> str:
+    """Get the next API key in rotation."""
+    global _current_key_index
+    
+    # First try environment variable
+    env_key = os.getenv("GOOGLE_API_KEY")
+    if env_key and _current_key_index == 0:
+        return env_key
+    
+    # Use backup keys
+    backup_index = _current_key_index - 1 if env_key else _current_key_index
+    if 0 <= backup_index < len(BACKUP_API_KEYS):
+        return BACKUP_API_KEYS[backup_index]
+    
+    # Cycle back to first backup key
+    _current_key_index = 1 if env_key else 0
+    return BACKUP_API_KEYS[0] if BACKUP_API_KEYS else None
+
+
+def rotate_api_key():
+    """Rotate to the next API key (call when rate limited)."""
+    global _current_key_index, _llm_instance
+    
+    env_key = os.getenv("GOOGLE_API_KEY")
+    max_keys = len(BACKUP_API_KEYS) + (1 if env_key else 0)
+    
+    _current_key_index = (_current_key_index + 1) % max_keys
+    _llm_instance = None  # Force re-creation of LLM
+    
+    print(f"Rotated to API key {_current_key_index + 1}/{max_keys}")
+
 
 def get_llm() -> Optional[Union["ChatGoogleGenerativeAI", "ChatOpenAI"]]:
     """
-    Initialize LLM - prioritizes Gemini, falls back to OpenAI.
+    Initialize LLM with rotating API keys.
+    Supports multiple Gemini API keys with automatic rotation on rate limit.
     Returns None if no API key is configured (agent still works with rule-based logic).
     """
-    # Try Gemini first (recommended - has free tier)
-    google_key = os.getenv("GOOGLE_API_KEY")
-    if google_key:
+    global _llm_instance
+    
+    if _llm_instance is not None:
+        return _llm_instance
+    
+    # Try Gemini with rotating keys
+    api_key = get_next_api_key()
+    if api_key:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
-            return ChatGoogleGenerativeAI(
+            _llm_instance = ChatGoogleGenerativeAI(
                 model="gemini-1.5-flash",  # Fast and free tier friendly
-                google_api_key=google_key,
+                google_api_key=api_key,
                 temperature=0,
             )
+            return _llm_instance
         except ImportError:
             print("Warning: langchain-google-genai not installed. Run: pip install langchain-google-genai")
     
@@ -47,11 +97,12 @@ def get_llm() -> Optional[Union["ChatGoogleGenerativeAI", "ChatOpenAI"]]:
     if openai_key:
         try:
             from langchain_openai import ChatOpenAI
-            return ChatOpenAI(
+            _llm_instance = ChatOpenAI(
                 model="gpt-4o-mini",
                 temperature=0,
                 api_key=openai_key,
             )
+            return _llm_instance
         except ImportError:
             print("Warning: langchain-openai not installed. Run: pip install langchain-openai")
     
@@ -129,7 +180,7 @@ def get_agent():
 
 async def run_query(query: str, session_id: Optional[str] = None) -> str:
     """
-    Run a query through the agent.
+    Run a query through the agent with automatic API key rotation on rate limit.
     
     Args:
         query: Natural language question
@@ -138,21 +189,39 @@ async def run_query(query: str, session_id: Optional[str] = None) -> str:
     Returns:
         Structured response string
     """
-    agent = get_agent()
+    global _agent_graph
+    max_retries = len(BACKUP_API_KEYS) + 1  # Try all available keys
     
-    # Create initial state
-    initial_state = AgentState(
-        user_query=query,
-        session_id=session_id,
-    )
+    for attempt in range(max_retries):
+        try:
+            agent = get_agent()
+            
+            # Create initial state
+            initial_state = AgentState(
+                user_query=query,
+                session_id=session_id,
+            )
+            
+            # Run the graph
+            final_state = await agent.ainvoke(initial_state)
+            
+            # Return the response
+            if isinstance(final_state, dict):
+                return final_state.get("final_response", "No response generated")
+            return final_state.final_response or "No response generated"
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check if rate limited or quota exceeded
+            if any(term in error_msg for term in ["rate limit", "quota", "429", "resource exhausted"]):
+                print(f"API rate limited (attempt {attempt + 1}/{max_retries}). Rotating key...")
+                rotate_api_key()
+                _agent_graph = None  # Force recreation of agent with new key
+            else:
+                # Not a rate limit error, re-raise
+                raise e
     
-    # Run the graph
-    final_state = await agent.ainvoke(initial_state)
-    
-    # Return the response
-    if isinstance(final_state, dict):
-        return final_state.get("final_response", "No response generated")
-    return final_state.final_response or "No response generated"
+    return "Error: All API keys exhausted. Please try again later."
 
 
 def run_query_sync(query: str, session_id: Optional[str] = None) -> str:
