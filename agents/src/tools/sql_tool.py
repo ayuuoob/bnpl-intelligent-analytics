@@ -123,7 +123,7 @@ class SQLTool(BaseTool):
         2. Check for blocked patterns
         3. Verify table allowlist
         4. Apply row limit
-        5. Execute via MCP
+        5. Execute via local data or MCP
         """
         # Validate query
         validation = self._validate_query(query, limit)
@@ -135,6 +135,14 @@ class SQLTool(BaseTool):
         warnings_text = ""
         if validation.warnings:
             warnings_text = "Warnings:\n" + "\n".join(f"- {w}" for w in validation.warnings) + "\n\n"
+        
+        # Check if using local data mode
+        use_local = os.getenv("USE_LOCAL_DATA", "false").lower() == "true"
+        
+        if use_local:
+            # Execute against local CSV data
+            result = self._execute_local_sql(validation.query)
+            return warnings_text + result
         
         # Execute via MCP
         client = get_mcp_client()
@@ -149,6 +157,102 @@ class SQLTool(BaseTool):
         # Fallback to mock execution for demo
         mock_result = self._mock_execute(validation.query)
         return warnings_text + mock_result
+    
+    def _execute_local_sql(self, query: str) -> str:
+        """Execute SQL-like query against local CSV data using pandas."""
+        try:
+            from .local_data import get_local_data
+            import pandas as pd
+            
+            # Get all local data
+            data = get_local_data()
+            
+            # Parse query to find what's needed
+            query_lower = query.lower()
+            
+            # Determine which data to use based on query
+            if "kpi_daily" in query_lower or "kpi" in query_lower:
+                # Aggregate KPI metrics
+                return self._execute_kpi_query(data, query)
+            elif "order" in query_lower:
+                df = data.get("orders", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "orders")
+            elif "user" in query_lower:
+                df = data.get("users", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "users")
+            elif "merchant" in query_lower:
+                df = data.get("merchants", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "merchants")
+            elif "installment" in query_lower or "payment" in query_lower:
+                df = data.get("installments", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "installments")
+            elif "dispute" in query_lower or "return" in query_lower:
+                df = data.get("disputes_returns", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "disputes_returns")
+            else:
+                # Default to orders
+                df = data.get("orders", pd.DataFrame())
+                return self._execute_pandas_query(df, query, "orders")
+                
+        except Exception as e:
+            return f"Local SQL Error: {str(e)}"
+    
+    def _execute_kpi_query(self, data: dict, query: str) -> str:
+        """Execute KPI-style query from local data."""
+        import pandas as pd
+        
+        orders_df = data.get("orders", pd.DataFrame())
+        users_df = data.get("users", pd.DataFrame())
+        installments_df = data.get("installments", pd.DataFrame())
+        
+        if orders_df.empty:
+            return "No order data available."
+        
+        # Basic KPI aggregation
+        results = []
+        
+        # Calculate daily metrics
+        if "date" in orders_df.columns or "created_at" in orders_df.columns:
+            date_col = "date" if "date" in orders_df.columns else "created_at"
+            orders_df[date_col] = pd.to_datetime(orders_df[date_col])
+            
+            daily = orders_df.groupby(orders_df[date_col].dt.date).agg({
+                "amount": "sum",
+                "order_id": "count" if "order_id" in orders_df.columns else "size"
+            }).reset_index()
+            daily.columns = ["date", "gmv", "orders"]
+            
+            # Get last 10 days
+            daily = daily.tail(10)
+            
+            result_data = {
+                "columns": ["date", "gmv", "orders"],
+                "rows": daily.to_dict("records")
+            }
+            return "_Using local CSV data_\n\n" + self._format_results(result_data)
+        
+        return "Date column not found in orders data."
+    
+    def _execute_pandas_query(self, df: pd.DataFrame, query: str, table_name: str) -> str:
+        """Execute a simple query against a pandas DataFrame."""
+        import pandas as pd
+        
+        if df.empty:
+            return f"No {table_name} data available."
+        
+        # Apply limit from query
+        limit_match = re.search(r'LIMIT\s+(\d+)', query, re.IGNORECASE)
+        limit = int(limit_match.group(1)) if limit_match else 50
+        
+        # Get sample of data
+        result_df = df.head(limit)
+        
+        result_data = {
+            "columns": list(result_df.columns),
+            "rows": result_df.to_dict("records")
+        }
+        
+        return f"_Using local CSV data ({len(df)} total rows)_\n\n" + self._format_results(result_data)
     
     def _validate_query(self, query: str, limit: Optional[int] = None) -> SQLValidationResult:
         """Validate SQL query against guardrails."""
