@@ -23,12 +23,26 @@ from .nodes import (
     NarratorNode,
 )
 
-# Backup API keys for rotation when rate limited
-BACKUP_API_KEYS = [
-    "AIzaSyD1TgM4t5OzhEjQX8JOwq7rXfQJYTFcHRQ",
-    "AIzaSyBrK8Oby0jULyMdf6rPyf4v3UuhQH_6kek",
-    "AIzaSyCFSlT8bDXXrs4a4niOOeaFLyRFIv1Rh4Y",
-]
+def _load_api_keys() -> list:
+    """Load all API keys from environment variables."""
+    keys = []
+    
+    # Load numbered keys (GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, etc.)
+    for i in range(1, 10):  # Support up to 9 keys
+        key = os.getenv(f"GOOGLE_API_KEY_{i}")
+        if key:
+            keys.append(key)
+    
+    # Also check for legacy single key
+    legacy_key = os.getenv("GOOGLE_API_KEY")
+    if legacy_key and legacy_key not in keys:
+        keys.insert(0, legacy_key)
+    
+    return keys
+
+
+# Load API keys from environment
+API_KEYS = _load_api_keys()
 
 # Track current API key index
 _current_key_index = 0
@@ -39,32 +53,28 @@ def get_next_api_key() -> str:
     """Get the next API key in rotation."""
     global _current_key_index
     
-    # First try environment variable
-    env_key = os.getenv("GOOGLE_API_KEY")
-    if env_key and _current_key_index == 0:
-        return env_key
+    if not API_KEYS:
+        return None
     
-    # Use backup keys
-    backup_index = _current_key_index - 1 if env_key else _current_key_index
-    if 0 <= backup_index < len(BACKUP_API_KEYS):
-        return BACKUP_API_KEYS[backup_index]
+    if _current_key_index < len(API_KEYS):
+        return API_KEYS[_current_key_index]
     
-    # Cycle back to first backup key
-    _current_key_index = 1 if env_key else 0
-    return BACKUP_API_KEYS[0] if BACKUP_API_KEYS else None
+    # Cycle back to first key
+    _current_key_index = 0
+    return API_KEYS[0]
 
 
 def rotate_api_key():
     """Rotate to the next API key (call when rate limited)."""
     global _current_key_index, _llm_instance
     
-    env_key = os.getenv("GOOGLE_API_KEY")
-    max_keys = len(BACKUP_API_KEYS) + (1 if env_key else 0)
+    if not API_KEYS:
+        return
     
-    _current_key_index = (_current_key_index + 1) % max_keys
+    _current_key_index = (_current_key_index + 1) % len(API_KEYS)
     _llm_instance = None  # Force re-creation of LLM
     
-    print(f"Rotated to API key {_current_key_index + 1}/{max_keys}")
+    print(f"Rotated to API key {_current_key_index + 1}/{len(API_KEYS)}")
 
 
 def get_llm() -> Optional[Union["ChatGoogleGenerativeAI", "ChatOpenAI"]]:
@@ -190,7 +200,7 @@ async def run_query(query: str, session_id: Optional[str] = None) -> str:
         Structured response string
     """
     global _agent_graph
-    max_retries = len(BACKUP_API_KEYS) + 1  # Try all available keys
+    max_retries = max(len(API_KEYS), 1)  # Try all available keys
     
     for attempt in range(max_retries):
         try:
